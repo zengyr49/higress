@@ -92,6 +92,10 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, c config.PluginConfig, log lo
 
 func onHttpRequestBody(ctx wrapper.HttpContext, c config.PluginConfig, body []byte, log log.Log) types.Action {
 	bodyJson := gjson.ParseBytes(body)
+	// 如果路径未匹配到 responses API，则通过请求体中的 input 字段判断
+	if !isResponsesAPI(ctx) && bodyJson.Get("input").Exists() {
+		ctx.SetContext(API_TYPE_CONTEXT_KEY, API_TYPE_RESPONSES)
+	}
 	// TODO: It may be necessary to support stream mode determination for different LLM providers.
 	stream := false
 	if bodyJson.Get("stream").Bool() {
