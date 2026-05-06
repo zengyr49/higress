@@ -21,10 +21,13 @@ const (
 	PARTIAL_MESSAGE_CONTEXT_KEY = "partialMessage"
 	TOOL_CALLS_CONTEXT_KEY      = "toolCalls"
 	STREAM_CONTEXT_KEY          = "stream"
+	API_TYPE_CONTEXT_KEY        = "apiType"
 	SKIP_CACHE_HEADER           = "x-higress-skip-ai-cache"
 	ERROR_PARTIAL_MESSAGE_KEY   = "errorPartialMessage"
 
 	DEFAULT_MAX_BODY_BYTES uint32 = 100 * 1024 * 1024
+
+	API_TYPE_RESPONSES = "responses"
 )
 
 func main() {}
@@ -76,6 +79,10 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, c config.PluginConfig, log lo
 		ctx.DontReadRequestBody()
 		return types.ActionContinue
 	}
+	path, _ := proxywasm.GetHttpRequestHeader(":path")
+	if isResponsesAPIPath(path) {
+		ctx.SetContext(API_TYPE_CONTEXT_KEY, API_TYPE_RESPONSES)
+	}
 	ctx.SetRequestBodyBufferLimit(DEFAULT_MAX_BODY_BYTES)
 	_ = proxywasm.RemoveHttpRequestHeader("Accept-Encoding")
 	// The request has a body and requires delaying the header transmission until a cache miss occurs,
@@ -96,16 +103,23 @@ func onHttpRequestBody(ctx wrapper.HttpContext, c config.PluginConfig, body []by
 	if c.CacheKeyStrategy == config.CACHE_KEY_STRATEGY_LAST_QUESTION {
 		log.Debugf("[onHttpRequestBody] cache key strategy is last question, cache key from: %s", c.CacheKeyFrom)
 		key = bodyJson.Get(c.CacheKeyFrom).String()
+		if key == "" && isResponsesAPI(ctx) {
+			key = extractResponsesCacheKey(bodyJson, c.CacheKeyStrategy)
+		}
 	} else if c.CacheKeyStrategy == config.CACHE_KEY_STRATEGY_ALL_QUESTIONS {
 		log.Debugf("[onHttpRequestBody] cache key strategy is all questions, cache key from: messages")
-		messages := bodyJson.Get("messages").Array()
-		var userMessages []string
-		for _, msg := range messages {
-			if msg.Get("role").String() == "user" {
-				userMessages = append(userMessages, msg.Get("content").String())
+		if isResponsesAPI(ctx) {
+			key = extractResponsesCacheKey(bodyJson, c.CacheKeyStrategy)
+		} else {
+			messages := bodyJson.Get("messages").Array()
+			var userMessages []string
+			for _, msg := range messages {
+				if msg.Get("role").String() == "user" {
+					userMessages = append(userMessages, msg.Get("content").String())
+				}
 			}
+			key = strings.Join(userMessages, "\n")
 		}
-		key = strings.Join(userMessages, "\n")
 	} else if c.CacheKeyStrategy == config.CACHE_KEY_STRATEGY_DISABLED {
 		log.Info("[onHttpRequestBody] cache key strategy is disabled")
 		ctx.DontReadResponseBody()
@@ -192,6 +206,10 @@ func onHttpResponseBody(ctx wrapper.HttpContext, c config.PluginConfig, chunk []
 
 	if err != nil {
 		log.Errorf("[onHttpResponseBody] process last chunk failed, error: %v", err)
+		return chunk
+	}
+	if ctx.GetContext(TOOL_CALLS_CONTEXT_KEY) != nil {
+		log.Debug("[onHttpResponseBody] tool calls detected, skip cache")
 		return chunk
 	}
 

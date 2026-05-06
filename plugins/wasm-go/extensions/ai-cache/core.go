@@ -77,11 +77,20 @@ func processCacheHit(key string, response string, stream bool, ctx wrapper.HttpC
 	ctx.SetUserAttribute("cache_status", "hit")
 	ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey)
 
-	if stream {
-		proxywasm.SendHttpResponseWithDetail(200, "ai-cache.hit", [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, []byte(fmt.Sprintf(c.StreamResponseTemplate, escapedResponse)), -1)
+	if isResponsesAPI(ctx) && stream {
+		proxywasm.SendHttpResponseWithDetail(200, "ai-cache.hit", [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, renderCacheTemplate(c.ResponsesStreamResponseTemplate, escapedResponse), -1)
+	} else if isResponsesAPI(ctx) {
+		proxywasm.SendHttpResponseWithDetail(200, "ai-cache.hit", [][2]string{{"content-type", "application/json; charset=utf-8"}}, renderCacheTemplate(c.ResponsesResponseTemplate, escapedResponse), -1)
+	} else if stream {
+		proxywasm.SendHttpResponseWithDetail(200, "ai-cache.hit", [][2]string{{"content-type", "text/event-stream; charset=utf-8"}}, renderCacheTemplate(c.StreamResponseTemplate, escapedResponse), -1)
 	} else {
-		proxywasm.SendHttpResponseWithDetail(200, "ai-cache.hit", [][2]string{{"content-type", "application/json; charset=utf-8"}}, []byte(fmt.Sprintf(c.ResponseTemplate, escapedResponse)), -1)
+		proxywasm.SendHttpResponseWithDetail(200, "ai-cache.hit", [][2]string{{"content-type", "application/json; charset=utf-8"}}, renderCacheTemplate(c.ResponseTemplate, escapedResponse), -1)
 	}
+}
+
+func renderCacheTemplate(template string, escapedResponse string) []byte {
+	template = strings.ReplaceAll(template, "%s", "%[1]s")
+	return []byte(fmt.Sprintf(template, escapedResponse))
 }
 
 // performSimilaritySearch determines the appropriate similarity search method to use.

@@ -65,10 +65,93 @@ func processNonStreamLastChunk(ctx wrapper.HttpContext, c config.PluginConfig, c
 	}
 	bodyJson := gjson.ParseBytes(body)
 	value := bodyJson.Get(c.CacheValueFrom).String()
+	if value == "" && isResponsesAPI(ctx) {
+		value = extractResponsesOutputText(bodyJson)
+	}
 	if strings.TrimSpace(value) == "" {
 		return "", fmt.Errorf("[processNonStreamLastChunk] parse value from response body failed, body:%s", body)
 	}
 	return value, nil
+}
+
+func isResponsesAPIPath(path string) bool {
+	path = strings.TrimRight(path, "/")
+	if queryIndex := strings.Index(path, "?"); queryIndex >= 0 {
+		path = path[:queryIndex]
+	}
+	return strings.HasSuffix(path, "/responses")
+}
+
+func isResponsesAPI(ctx wrapper.HttpContext) bool {
+	apiType, _ := ctx.GetContext(API_TYPE_CONTEXT_KEY).(string)
+	return apiType == API_TYPE_RESPONSES
+}
+
+func extractResponsesCacheKey(bodyJson gjson.Result, strategy string) string {
+	input := bodyJson.Get("input")
+	if !input.Exists() {
+		return ""
+	}
+	if input.Type == gjson.String {
+		return input.String()
+	}
+	items := input.Array()
+	switch strategy {
+	case config.CACHE_KEY_STRATEGY_LAST_QUESTION:
+		for i := len(items) - 1; i >= 0; i-- {
+			if text := extractResponsesInputText(items[i], true); text != "" {
+				return text
+			}
+		}
+	case config.CACHE_KEY_STRATEGY_ALL_QUESTIONS:
+		var userMessages []string
+		for _, item := range items {
+			if text := extractResponsesInputText(item, true); text != "" {
+				userMessages = append(userMessages, text)
+			}
+		}
+		return strings.Join(userMessages, "\n")
+	}
+	return ""
+}
+
+func extractResponsesInputText(item gjson.Result, requireUserRole bool) string {
+	if requireUserRole && item.Get("role").String() != "user" {
+		return ""
+	}
+	return extractResponsesContentText(item.Get("content"), "input_text")
+}
+
+func extractResponsesOutputText(bodyJson gjson.Result) string {
+	if outputText := bodyJson.Get("output_text").String(); outputText != "" {
+		return outputText
+	}
+	var contents []string
+	for _, output := range bodyJson.Get("output").Array() {
+		if output.Get("type").String() != "message" {
+			continue
+		}
+		if text := extractResponsesContentText(output.Get("content"), "output_text"); text != "" {
+			contents = append(contents, text)
+		}
+	}
+	return strings.Join(contents, "")
+}
+
+func extractResponsesContentText(content gjson.Result, textType string) string {
+	if !content.Exists() {
+		return ""
+	}
+	if content.Type == gjson.String {
+		return content.String()
+	}
+	var texts []string
+	for _, part := range content.Array() {
+		if part.Get("type").String() == textType {
+			texts = append(texts, part.Get("text").String())
+		}
+	}
+	return strings.Join(texts, "")
 }
 
 func processStreamLastChunk(ctx wrapper.HttpContext, c config.PluginConfig, chunk []byte, log log.Log) (string, error) {
@@ -120,6 +203,17 @@ func processSSEMessage(ctx wrapper.HttpContext, c config.PluginConfig, sseMessag
 			return content, nil
 		}
 
+		if isResponsesAPI(ctx) {
+			responseContent := extractResponsesStreamText(bodyJson)
+			if responseContent != "" {
+				content += responseContent
+			}
+			if isResponsesToolCallStreamEvent(bodyJson) {
+				ctx.SetContext(TOOL_CALLS_CONTEXT_KEY, bodyJson)
+			}
+			continue
+		}
+
 		// Extract values from JSON fields
 		responseBody := gjson.Get(bodyJson, c.CacheStreamValueFrom)
 		toolCalls := gjson.Get(bodyJson, c.CacheToolCallsFrom)
@@ -148,4 +242,16 @@ func processSSEMessage(ctx wrapper.HttpContext, c config.PluginConfig, sseMessag
 		ctx.SetContext(CACHE_CONTENT_CONTEXT_KEY, tempContentI.(string)+content)
 	}
 	return content, nil
+}
+
+func extractResponsesStreamText(bodyJson string) string {
+	if gjson.Get(bodyJson, "type").String() != "response.output_text.delta" {
+		return ""
+	}
+	return gjson.Get(bodyJson, "delta").String()
+}
+
+func isResponsesToolCallStreamEvent(bodyJson string) bool {
+	eventType := gjson.Get(bodyJson, "type").String()
+	return strings.Contains(eventType, "function_call") || strings.Contains(eventType, "tool_call")
 }

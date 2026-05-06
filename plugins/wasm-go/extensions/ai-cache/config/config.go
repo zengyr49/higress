@@ -23,6 +23,12 @@ type PluginConfig struct {
 	// @Title zh-CN 返回流式 HTTP 响应的模版
 	// @Description zh-CN 用 %s 标记需要被 cache value 替换的部分
 	StreamResponseTemplate string
+	// @Title zh-CN 返回 Responses API HTTP 响应的模版
+	// @Description zh-CN 用 %s 标记需要被 cache value 替换的部分
+	ResponsesResponseTemplate string
+	// @Title zh-CN 返回 Responses API 流式 HTTP 响应的模版
+	// @Description zh-CN 用 %s 标记需要被 cache value 替换的部分
+	ResponsesStreamResponseTemplate string
 
 	cacheProvider     cache.Provider
 	embeddingProvider embedding.Provider
@@ -86,6 +92,14 @@ func (c *PluginConfig) FromJson(json gjson.Result, log log.Log) {
 	c.ResponseTemplate = json.Get("responseTemplate").String()
 	if c.ResponseTemplate == "" {
 		c.ResponseTemplate = `{"id":"from-cache","choices":[{"index":0,"message":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"model":"from-cache","object":"chat.completion","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`
+	}
+	c.ResponsesStreamResponseTemplate = json.Get("responsesStreamResponseTemplate").String()
+	if c.ResponsesStreamResponseTemplate == "" {
+		c.ResponsesStreamResponseTemplate = `event: response.output_text.delta` + "\n" + `data: {"type":"response.output_text.delta","delta":"%s"}` + "\n\n" + `event: response.completed` + "\n" + `data: {"type":"response.completed","response":{"id":"from-cache","object":"response","status":"completed","model":"from-cache","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"%s"}]}],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}` + "\n\n"
+	}
+	c.ResponsesResponseTemplate = json.Get("responsesResponseTemplate").String()
+	if c.ResponsesResponseTemplate == "" {
+		c.ResponsesResponseTemplate = `{"id":"from-cache","object":"response","status":"completed","model":"from-cache","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"%s"}]}],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}`
 	}
 
 	if json.Get("enableSemanticCache").Exists() {

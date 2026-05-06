@@ -839,6 +839,66 @@ func TestOnHttpResponseBody(t *testing.T) {
 			require.JSONEq(t, expectedResponseBody, actualResponseBody)
 		})
 
+		t.Run("responses api non-stream response body", func(t *testing.T) {
+			host, status := test.NewTestHost(minimalConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/responses"},
+				{":method", "POST"},
+				{"content-type", "application/json"},
+			})
+
+			requestBody := `{
+				"model": "gpt-4.1",
+				"input": "讲一个关于 Higress 的一句话介绍",
+				"stream": false
+			}`
+			action := host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionPause, action)
+
+			redisCalls := host.GetRedisCalloutAttributes()
+			require.Len(t, redisCalls, 1)
+			require.Contains(t, string(redisCalls[0].Query), "higress-ai-cache:讲一个关于 Higress 的一句话介绍")
+
+			cacheMissResp := test.CreateRedisRespNull()
+			host.CallOnRedisCall(0, cacheMissResp)
+
+			host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "200"},
+				{"content-type", "application/json"},
+			})
+
+			responseBody := `{
+				"id": "resp_123",
+				"object": "response",
+				"status": "completed",
+				"model": "gpt-4.1",
+				"output": [
+					{
+						"id": "msg_123",
+						"type": "message",
+						"role": "assistant",
+						"content": [
+							{
+								"type": "output_text",
+								"text": "Higress 是云原生 API 网关。"
+							}
+						]
+					}
+				]
+			}`
+			action = host.CallOnHttpResponseBody([]byte(responseBody))
+			require.Equal(t, types.ActionContinue, action)
+
+			redisCalls = host.GetRedisCalloutAttributes()
+			require.NotEmpty(t, redisCalls)
+			require.Contains(t, string(redisCalls[len(redisCalls)-1].Query), "Higress 是云原生 API 网关。")
+			require.JSONEq(t, responseBody, string(host.GetResponseBody()))
+		})
+
 		// 测试流式响应体处理
 		t.Run("stream response body", func(t *testing.T) {
 			host, status := test.NewTestHost(basicRedisConfig)
@@ -888,6 +948,53 @@ data: [DONE]`
 			require.Equal(t, types.ActionContinue, action)
 			actualStreamResponseBody := string(host.GetResponseBody())
 			require.Equal(t, expectedStreamResponseBody, actualStreamResponseBody)
+		})
+
+		t.Run("responses api stream response body", func(t *testing.T) {
+			host, status := test.NewTestHost(minimalConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/responses"},
+				{":method", "POST"},
+				{"content-type", "application/json"},
+			})
+
+			requestBody := `{
+				"model": "gpt-4.1",
+				"input": "讲一个关于 Higress 的一句话介绍",
+				"stream": true
+			}`
+			action := host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionPause, action)
+
+			cacheMissResp := test.CreateRedisRespNull()
+			host.CallOnRedisCall(0, cacheMissResp)
+
+			host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "200"},
+				{"content-type", "text/event-stream"},
+			})
+
+			streamResponseBody := `event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Higress 是"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"云原生 API 网关。"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_123","status":"completed"}}
+
+`
+			action = host.CallOnHttpStreamingResponseBody([]byte(streamResponseBody), true)
+			require.Equal(t, types.ActionContinue, action)
+
+			redisCalls := host.GetRedisCalloutAttributes()
+			require.NotEmpty(t, redisCalls)
+			require.Contains(t, string(redisCalls[len(redisCalls)-1].Query), "Higress 是云原生 API 网关。")
+			require.Equal(t, streamResponseBody, string(host.GetResponseBody()))
 		})
 
 		// 测试无缓存键的响应体处理
@@ -967,6 +1074,59 @@ func TestExternalServiceCalls(t *testing.T) {
 			host.CallOnRedisCall(0, cacheHitResp)
 
 			// 完成HTTP请求
+			host.CompleteHttp()
+		})
+
+		t.Run("responses api cache hit flow", func(t *testing.T) {
+			host, status := test.NewTestHost(minimalConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/responses"},
+				{":method", "POST"},
+				{"content-type", "application/json"},
+			})
+
+			requestBody := `{
+				"model": "gpt-4.1",
+				"input": "讲一个关于 Higress 的一句话介绍",
+				"stream": false
+			}`
+			action := host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionPause, action)
+
+			cacheHitResp := test.CreateRedisRespString(`Higress 是云原生 API 网关。`)
+			host.CallOnRedisCall(0, cacheHitResp)
+
+			localResponse := host.GetLocalResponse()
+			require.NotNil(t, localResponse)
+			require.Equal(t, uint32(200), localResponse.StatusCode)
+			require.JSONEq(t, `{
+				"id": "from-cache",
+				"object": "response",
+				"status": "completed",
+				"model": "from-cache",
+				"output": [
+					{
+						"type": "message",
+						"role": "assistant",
+						"content": [
+							{
+								"type": "output_text",
+								"text": "Higress 是云原生 API 网关。"
+							}
+						]
+					}
+				],
+				"usage": {
+					"input_tokens": 0,
+					"output_tokens": 0,
+					"total_tokens": 0
+				}
+			}`, string(localResponse.Data))
+
 			host.CompleteHttp()
 		})
 
@@ -1121,6 +1281,133 @@ data: [DONE]`,
 			host.CallOnRedisCall(0, cacheHitResp)
 
 			// 完成HTTP请求
+			host.CompleteHttp()
+		})
+
+		t.Run("responses api stream cache hit flow", func(t *testing.T) {
+			host, status := test.NewTestHost(minimalConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/responses"},
+				{":method", "POST"},
+				{"content-type", "application/json"},
+			})
+
+			requestBody := `{
+				"model": "gpt-4.1",
+				"input": "讲一个关于 Higress 的一句话介绍",
+				"stream": true
+			}`
+			action := host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionPause, action)
+
+			cacheHitResp := test.CreateRedisRespString(`Higress 是云原生 API 网关。`)
+			host.CallOnRedisCall(0, cacheHitResp)
+
+			localResponse := host.GetLocalResponse()
+			require.NotNil(t, localResponse)
+			require.Equal(t, uint32(200), localResponse.StatusCode)
+			responseBody := string(localResponse.Data)
+			require.Contains(t, responseBody, "event: response.output_text.delta")
+			require.Contains(t, responseBody, `"delta":"Higress 是云原生 API 网关。"`)
+			require.Contains(t, responseBody, "event: response.completed")
+			require.Contains(t, responseBody, `"object":"response"`)
+
+			host.CompleteHttp()
+		})
+
+		t.Run("responses api stream cache hit with single placeholder template", func(t *testing.T) {
+			singlePlaceholderConfig := func() json.RawMessage {
+				data, _ := json.Marshal(map[string]interface{}{
+					"cache": map[string]interface{}{
+						"type":        "redis",
+						"serviceName": "redis.static",
+						"servicePort": 6379,
+					},
+					"responsesStreamResponseTemplate": `event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"%s"}
+
+`,
+				})
+				return data
+			}()
+
+			host, status := test.NewTestHost(singlePlaceholderConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/responses"},
+				{":method", "POST"},
+				{"content-type", "application/json"},
+			})
+
+			requestBody := `{
+				"model": "gpt-4.1",
+				"input": "讲一个关于 Higress 的一句话介绍",
+				"stream": true
+			}`
+			action := host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionPause, action)
+
+			cacheHitResp := test.CreateRedisRespString(`Higress 是云原生 API 网关。`)
+			host.CallOnRedisCall(0, cacheHitResp)
+
+			localResponse := host.GetLocalResponse()
+			require.NotNil(t, localResponse)
+			responseBody := string(localResponse.Data)
+			require.Contains(t, responseBody, `"delta":"Higress 是云原生 API 网关。"`)
+			require.NotContains(t, responseBody, "%!(EXTRA")
+
+			host.CompleteHttp()
+		})
+
+		t.Run("responses api stream skips cache for tool call", func(t *testing.T) {
+			host, status := test.NewTestHost(minimalConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/responses"},
+				{":method", "POST"},
+				{"content-type", "application/json"},
+			})
+
+			requestBody := `{
+				"model": "gpt-4.1",
+				"input": "讲一个关于 Higress 的一句话介绍",
+				"stream": true
+			}`
+			action := host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionPause, action)
+
+			cacheMissResp := test.CreateRedisRespNull()
+			host.CallOnRedisCall(0, cacheMissResp)
+
+			host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "200"},
+				{"content-type", "text/event-stream"},
+			})
+
+			streamResponseBody := `event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"我需要查询"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"{\"city\":\"杭州\"}"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_123","status":"completed"}}
+
+`
+			action = host.CallOnHttpStreamingResponseBody([]byte(streamResponseBody), true)
+			require.Equal(t, types.ActionContinue, action)
+			require.Empty(t, host.GetRedisCalloutAttributes())
+
 			host.CompleteHttp()
 		})
 
