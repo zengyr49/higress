@@ -11,6 +11,7 @@ import (
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/higress-group/wasm-go/pkg/test"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 // Test config: Basic Bedrock config with AWS Access Key/Secret Key (AWS Signature V4)
@@ -110,6 +111,37 @@ var bedrockApiTokenConfig = func() json.RawMessage {
 			"awsRegion": "us-east-1",
 			"modelMapping": map[string]string{
 				"*": "anthropic.claude-3-5-haiku-20241022-v1:0",
+			},
+		},
+	})
+	return data
+}()
+
+var bedrockMantleApiTokenConfig = func() json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{
+		"provider": map[string]interface{}{
+			"type": "bedrock",
+			"apiTokens": []string{
+				"test-token-for-unit-test",
+			},
+			"awsRegion": "us-east-1",
+			"modelMapping": map[string]string{
+				"*": "anthropic.claude-opus-4-7",
+			},
+		},
+	})
+	return data
+}()
+
+var bedrockMantleAkSkConfig = func() json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{
+		"provider": map[string]interface{}{
+			"type":         "bedrock",
+			"awsAccessKey": "test-ak-for-unit-test",
+			"awsSecretKey": "test-sk-for-unit-test",
+			"awsRegion":    "us-east-1",
+			"modelMapping": map[string]string{
+				"*": "anthropic.claude-opus-4-7",
 			},
 		},
 	})
@@ -423,6 +455,136 @@ func RunBedrockOnHttpRequestBodyTests(t *testing.T) {
 			require.True(t, hasPath, "Path header should exist")
 			require.Contains(t, pathValue, "/model/", "Path should contain Bedrock model path")
 			require.Contains(t, pathValue, "/converse", "Path should contain converse endpoint")
+		})
+
+		t.Run("bedrock anthropic messages request should use mantle endpoint and preserve native body", func(t *testing.T) {
+			host, status := test.NewTestHost(bedrockMantleApiTokenConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/messages"},
+				{":method", "POST"},
+				{"Content-Type", "application/json"},
+			})
+			require.Equal(t, types.HeaderStopIteration, action)
+
+			requestHeaders := host.GetRequestHeaders()
+			hostValue, hasHost := test.GetHeaderValue(requestHeaders, ":authority")
+			require.True(t, hasHost, "Host header should exist")
+			require.Equal(t, "bedrock-mantle.us-east-1.api.aws", hostValue)
+
+			pathValue, hasPath := test.GetHeaderValue(requestHeaders, ":path")
+			require.True(t, hasPath, "Path header should exist")
+			require.Equal(t, "/anthropic/v1/messages", pathValue)
+
+			apiKeyValue, hasAPIKey := test.GetHeaderValue(requestHeaders, "x-api-key")
+			require.True(t, hasAPIKey, "x-api-key header should exist")
+			require.Equal(t, "test-token-for-unit-test", apiKeyValue)
+
+			_, hasAuth := test.GetHeaderValue(requestHeaders, "Authorization")
+			require.False(t, hasAuth, "Authorization header should not be sent for Mantle token auth")
+
+			anthropicVersion, hasAnthropicVersion := test.GetHeaderValue(requestHeaders, "anthropic-version")
+			require.True(t, hasAnthropicVersion, "anthropic-version header should exist")
+			require.Equal(t, "2023-06-01", anthropicVersion)
+
+			requestBody := `{
+					"model": "claude-request-model",
+					"max_tokens": 1024,
+					"messages": [{
+						"role": "assistant",
+						"content": [{
+							"type": "tool_use",
+							"id": "toolu_1",
+							"name": "list_items",
+							"input": {}
+						}]
+					}]
+				}`
+
+			action = host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionContinue, action)
+
+			processedBody := host.GetRequestBody()
+			require.Equal(t, "anthropic.claude-opus-4-7", gjson.GetBytes(processedBody, "model").String())
+			require.Equal(t, "{}", gjson.GetBytes(processedBody, "messages.0.content.0.input").Raw)
+			require.False(t, gjson.GetBytes(processedBody, "inferenceConfig").Exists(), "native Anthropic body should not be converted to Bedrock Converse")
+			require.False(t, gjson.GetBytes(processedBody, "toolConfig").Exists(), "native Anthropic tools should not be converted to Bedrock Converse")
+
+			requestHeaders = host.GetRequestHeaders()
+			pathValue, hasPath = test.GetHeaderValue(requestHeaders, ":path")
+			require.True(t, hasPath, "Path header should exist")
+			require.Equal(t, "/anthropic/v1/messages", pathValue)
+		})
+
+		t.Run("bedrock anthropic messages request with ak sk should sign for mantle service", func(t *testing.T) {
+			host, status := test.NewTestHost(bedrockMantleAkSkConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/messages"},
+				{":method", "POST"},
+				{"Content-Type", "application/json"},
+			})
+			require.Equal(t, types.HeaderStopIteration, action)
+
+			requestBody := `{
+					"model": "claude-request-model",
+					"max_tokens": 1024,
+					"messages": [{"role": "user", "content": "Hello"}]
+				}`
+			action = host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionContinue, action)
+
+			requestHeaders := host.GetRequestHeaders()
+			hostValue, hasHost := test.GetHeaderValue(requestHeaders, ":authority")
+			require.True(t, hasHost, "Host header should exist")
+			require.Equal(t, "bedrock-mantle.us-east-1.api.aws", hostValue)
+
+			pathValue, hasPath := test.GetHeaderValue(requestHeaders, ":path")
+			require.True(t, hasPath, "Path header should exist")
+			require.Equal(t, "/anthropic/v1/messages", pathValue)
+
+			authValue, hasAuth := test.GetHeaderValue(requestHeaders, "Authorization")
+			require.True(t, hasAuth, "Authorization header should exist")
+			require.Contains(t, authValue, "AWS4-HMAC-SHA256")
+			require.Contains(t, authValue, "/bedrock-mantle/aws4_request")
+		})
+
+		t.Run("bedrock anthropic messages streaming request should keep mantle path and accept sse", func(t *testing.T) {
+			host, status := test.NewTestHost(bedrockMantleApiTokenConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/messages"},
+				{":method", "POST"},
+				{"Content-Type", "application/json"},
+			})
+			require.Equal(t, types.HeaderStopIteration, action)
+
+			requestBody := `{
+					"model": "claude-request-model",
+					"max_tokens": 1024,
+					"messages": [{"role": "user", "content": "Hello"}],
+					"stream": true
+				}`
+			action = host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionContinue, action)
+
+			requestHeaders := host.GetRequestHeaders()
+			pathValue, hasPath := test.GetHeaderValue(requestHeaders, ":path")
+			require.True(t, hasPath, "Path header should exist")
+			require.Equal(t, "/anthropic/v1/messages", pathValue)
+
+			acceptValue, hasAccept := test.GetHeaderValue(requestHeaders, "Accept")
+			require.True(t, hasAccept, "Accept header should exist")
+			require.Equal(t, "text/event-stream", acceptValue)
 		})
 
 		t.Run("bedrock request body prompt cache in-memory should inject system cache point only by default", func(t *testing.T) {
@@ -1365,6 +1527,177 @@ func RunBedrockToolCallTests(t *testing.T) {
 			require.Equal(t, "call_002", secondResult["toolUseId"])
 		})
 
+		t.Run("bedrock maps any tool choice to converse any tool choice", func(t *testing.T) {
+			host, status := test.NewTestHost(bedrockApiTokenConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/chat/completions"},
+				{":method", "POST"},
+				{"Content-Type", "application/json"},
+			})
+			require.Equal(t, types.HeaderStopIteration, action)
+
+			requestBody := `{
+				"model": "gpt-4",
+				"messages": [{"role": "user", "content": "Run a search."}],
+				"tool_choice": "any",
+				"tools": [{
+					"type": "function",
+					"function": {
+						"name": "web_search",
+						"description": "Search the web.",
+						"parameters": {
+							"type": "object",
+							"properties": {"query": {"type": "string"}},
+							"required": ["query"]
+						}
+					}
+				}]
+			}`
+
+			action = host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionContinue, action)
+
+			processedBody := host.GetRequestBody()
+			require.NotNil(t, processedBody)
+
+			var bodyMap map[string]interface{}
+			err := json.Unmarshal(processedBody, &bodyMap)
+			require.NoError(t, err)
+
+			toolConfig := bodyMap["toolConfig"].(map[string]interface{})
+			toolChoice := toolConfig["toolChoice"].(map[string]interface{})
+			require.Contains(t, toolChoice, "any")
+			require.Equal(t, map[string]interface{}{}, toolChoice["any"])
+		})
+
+		t.Run("bedrock maps object tool choice to converse tool choice", func(t *testing.T) {
+			host, status := test.NewTestHost(bedrockApiTokenConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/chat/completions"},
+				{":method", "POST"},
+				{"Content-Type", "application/json"},
+			})
+			require.Equal(t, types.HeaderStopIteration, action)
+
+			requestBody := `{
+				"model": "gpt-4",
+				"messages": [{"role": "user", "content": "Run a search."}],
+				"tool_choice": {"type":"function","function":{"name":"web_search"}},
+				"tools": [{
+					"type": "function",
+					"function": {
+						"name": "web_search",
+						"description": "Search the web.",
+						"parameters": {
+							"type": "object",
+							"properties": {"query": {"type": "string"}},
+							"required": ["query"]
+						}
+					}
+				}]
+			}`
+
+			action = host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionContinue, action)
+
+			processedBody := host.GetRequestBody()
+			require.NotNil(t, processedBody)
+
+			var bodyMap map[string]interface{}
+			err := json.Unmarshal(processedBody, &bodyMap)
+			require.NoError(t, err)
+
+			toolConfig := bodyMap["toolConfig"].(map[string]interface{})
+			toolChoice := toolConfig["toolChoice"].(map[string]interface{})
+			tool := toolChoice["tool"].(map[string]interface{})
+			require.Equal(t, "web_search", tool["name"])
+			require.Len(t, tool, 1, "Bedrock specific tool choice should only include name")
+		})
+
+		t.Run("bedrock maps object any tool choice to converse any tool choice", func(t *testing.T) {
+			host, status := test.NewTestHost(bedrockApiTokenConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/chat/completions"},
+				{":method", "POST"},
+				{"Content-Type", "application/json"},
+			})
+			require.Equal(t, types.HeaderStopIteration, action)
+
+			requestBody := `{
+				"model": "gpt-4",
+				"messages": [{"role": "user", "content": "Run a search."}],
+				"tool_choice": {"type":"any"},
+				"tools": [{
+					"type": "function",
+					"function": {
+						"name": "web_search",
+						"description": "Search the web.",
+						"parameters": {"type": "object"}
+					}
+				}]
+			}`
+
+			action = host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionContinue, action)
+
+			var bodyMap map[string]interface{}
+			err := json.Unmarshal(host.GetRequestBody(), &bodyMap)
+			require.NoError(t, err)
+
+			toolConfig := bodyMap["toolConfig"].(map[string]interface{})
+			toolChoice := toolConfig["toolChoice"].(map[string]interface{})
+			require.Contains(t, toolChoice, "any")
+			require.NotContains(t, toolChoice, "tool")
+		})
+
+		t.Run("bedrock maps none tool choice by omitting tools", func(t *testing.T) {
+			host, status := test.NewTestHost(bedrockApiTokenConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/chat/completions"},
+				{":method", "POST"},
+				{"Content-Type", "application/json"},
+			})
+			require.Equal(t, types.HeaderStopIteration, action)
+
+			requestBody := `{
+				"model": "gpt-4",
+				"messages": [{"role": "user", "content": "Answer without tools."}],
+				"tool_choice": {"type":"none"},
+				"tools": [{
+					"type": "function",
+					"function": {
+						"name": "web_search",
+						"description": "Search the web.",
+						"parameters": {"type": "object"}
+					}
+				}]
+			}`
+
+			action = host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionContinue, action)
+
+			var bodyMap map[string]interface{}
+			err := json.Unmarshal(host.GetRequestBody(), &bodyMap)
+			require.NoError(t, err)
+			require.NotContains(t, bodyMap, "toolConfig")
+		})
+
 		// Test tool call with text content mixed
 		t.Run("bedrock tool call with text content mixed", func(t *testing.T) {
 			host, status := test.NewTestHost(bedrockApiTokenConfig)
@@ -1650,6 +1983,40 @@ func RunBedrockOnHttpResponseBodyTests(t *testing.T) {
 			_, hasCacheWriteTokens := promptTokensDetails["cache_write_tokens"]
 			require.False(t, hasCacheWriteTokens, "cache_write_tokens should not exist in OpenAI-compatible usage")
 		})
+
+		t.Run("bedrock anthropic messages response body should pass through", func(t *testing.T) {
+			host, status := test.NewTestHost(bedrockMantleApiTokenConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/messages"},
+				{":method", "POST"},
+				{"Content-Type", "application/json"},
+			})
+			require.Equal(t, types.HeaderStopIteration, action)
+
+			requestBody := `{
+					"model": "claude-request-model",
+					"max_tokens": 1024,
+					"messages": [{"role": "user", "content": "Hello"}]
+				}`
+			action = host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionContinue, action)
+
+			host.SetProperty([]string{"response", "code_details"}, []byte("via_upstream"))
+			action = host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "200"},
+				{"Content-Type", "application/json"},
+			})
+			require.Equal(t, types.ActionContinue, action)
+
+			responseBody := `{"id":"msg_01","type":"message","role":"assistant","model":"anthropic.claude-opus-4-7","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":2}}`
+			action = host.CallOnHttpResponseBody([]byte(responseBody))
+			require.Equal(t, types.ActionContinue, action)
+			require.JSONEq(t, responseBody, string(host.GetResponseBody()))
+		})
 	})
 }
 
@@ -1667,6 +2034,173 @@ func RunBedrockOnStreamingResponseBodyTests(t *testing.T) {
 		t.Run("extract first data payload should return empty when no data line", func(t *testing.T) {
 			payload := extractFirstDataPayload([]byte("event: ping\n\n"))
 			require.Equal(t, "", payload)
+		})
+
+		t.Run("bedrock anthropic messages streaming response should pass through mantle sse", func(t *testing.T) {
+			host, status := test.NewTestHost(bedrockMantleApiTokenConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/messages"},
+				{":method", "POST"},
+				{"Content-Type", "application/json"},
+			})
+			require.Equal(t, types.HeaderStopIteration, action)
+
+			requestBody := `{
+					"model": "claude-request-model",
+					"max_tokens": 1024,
+					"messages": [{"role": "user", "content": "Hello"}],
+					"stream": true
+				}`
+			action = host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionContinue, action)
+
+			host.SetProperty([]string{"response", "code_details"}, []byte("via_upstream"))
+			action = host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "200"},
+				{"Content-Type", "text/event-stream; charset=utf-8"},
+			})
+			require.Equal(t, types.ActionContinue, action)
+
+			chunk := []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n")
+			action = host.CallOnHttpStreamingResponseBody(chunk, false)
+			require.Equal(t, types.ActionContinue, action)
+			require.Equal(t, chunk, host.GetResponseBody())
+		})
+
+		t.Run("bedrock streaming parallel tool calls should use dense OpenAI indexes", func(t *testing.T) {
+			host, status := test.NewTestHost(bedrockApiTokenConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/chat/completions"},
+				{":method", "POST"},
+				{"Content-Type", "application/json"},
+			})
+			require.Equal(t, types.HeaderStopIteration, action)
+
+			requestBody := `{
+				"model": "gpt-4",
+				"messages": [{"role": "user", "content": "Run three independent searches."}],
+				"stream": true,
+				"tools": [{
+					"type": "function",
+					"function": {
+						"name": "web_search",
+						"description": "Search the web.",
+						"parameters": {
+							"type": "object",
+							"properties": {"query": {"type": "string"}},
+							"required": ["query"]
+						}
+					}
+				}]
+			}`
+			action = host.CallOnHttpRequestBody([]byte(requestBody))
+			require.Equal(t, types.ActionContinue, action)
+
+			host.SetProperty([]string{"response", "code_details"}, []byte("via_upstream"))
+			action = host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "200"},
+				{"Content-Type", "application/vnd.amazon.eventstream"},
+			})
+			require.Equal(t, types.ActionContinue, action)
+
+			extractFirstToolCallIndex := func(body []byte) int {
+				dataPayload := extractFirstDataPayload(body)
+				require.NotEmpty(t, dataPayload, "streaming chunk should contain one SSE data payload")
+
+				var responseMap map[string]interface{}
+				err := json.Unmarshal([]byte(dataPayload), &responseMap)
+				require.NoError(t, err)
+
+				choices := responseMap["choices"].([]interface{})
+				require.Len(t, choices, 1, "streaming chunk should contain one choice")
+				delta := choices[0].(map[string]interface{})["delta"].(map[string]interface{})
+				toolCalls := delta["tool_calls"].([]interface{})
+				require.Len(t, toolCalls, 1, "streaming chunk should contain one tool call delta")
+
+				index, ok := toolCalls[0].(map[string]interface{})["index"].(float64)
+				require.True(t, ok, "tool call delta should include an index")
+				return int(index)
+			}
+			extractFirstToolCall := func(body []byte) map[string]interface{} {
+				dataPayload := extractFirstDataPayload(body)
+				require.NotEmpty(t, dataPayload, "streaming chunk should contain one SSE data payload")
+
+				var responseMap map[string]interface{}
+				err := json.Unmarshal([]byte(dataPayload), &responseMap)
+				require.NoError(t, err)
+
+				choices := responseMap["choices"].([]interface{})
+				require.Len(t, choices, 1, "streaming chunk should contain one choice")
+				delta := choices[0].(map[string]interface{})["delta"].(map[string]interface{})
+				toolCalls := delta["tool_calls"].([]interface{})
+				require.Len(t, toolCalls, 1, "streaming chunk should contain one tool call delta")
+
+				toolCall, ok := toolCalls[0].(map[string]interface{})
+				require.True(t, ok, "tool call delta should be an object")
+				return toolCall
+			}
+
+			for expectedIndex, item := range []struct {
+				contentBlockIndex int
+				toolUseId         string
+			}{
+				{contentBlockIndex: 1, toolUseId: "tooluse_first"},
+				{contentBlockIndex: 3, toolUseId: "tooluse_second"},
+				{contentBlockIndex: 4, toolUseId: "tooluse_third"},
+			} {
+				toolCallStart := buildBedrockEventStreamMessage(t, map[string]interface{}{
+					"contentBlockIndex": item.contentBlockIndex,
+					"start": map[string]interface{}{
+						"toolUse": map[string]interface{}{
+							"toolUseId": item.toolUseId,
+							"name":      "web_search",
+						},
+					},
+				})
+				action = host.CallOnHttpStreamingResponseBody(toolCallStart, false)
+				require.Equal(t, types.ActionContinue, action)
+				toolCall := extractFirstToolCall(host.GetResponseBody())
+				require.Equal(t, expectedIndex, extractFirstToolCallIndex(host.GetResponseBody()))
+				require.Equal(t, item.toolUseId, toolCall["id"])
+				require.Equal(t, "function", toolCall["type"])
+				function := toolCall["function"].(map[string]interface{})
+				require.Equal(t, "web_search", function["name"])
+				require.Equal(t, "", function["arguments"])
+			}
+
+			for expectedIndex, item := range []struct {
+				contentBlockIndex int
+				query             string
+			}{
+				{contentBlockIndex: 1, query: "first synthetic query"},
+				{contentBlockIndex: 3, query: "second synthetic query"},
+				{contentBlockIndex: 4, query: "third synthetic query"},
+			} {
+				toolCallDelta := buildBedrockEventStreamMessage(t, map[string]interface{}{
+					"contentBlockIndex": item.contentBlockIndex,
+					"delta": map[string]interface{}{
+						"toolUse": map[string]interface{}{
+							"input": "{\"query\":\"" + item.query + "\"}",
+						},
+					},
+				})
+				action = host.CallOnHttpStreamingResponseBody(toolCallDelta, false)
+				require.Equal(t, types.ActionContinue, action)
+				toolCall := extractFirstToolCall(host.GetResponseBody())
+				require.Equal(t, expectedIndex, extractFirstToolCallIndex(host.GetResponseBody()))
+				require.NotContains(t, toolCall, "id")
+				function := toolCall["function"].(map[string]interface{})
+				require.NotContains(t, function, "name")
+				require.Equal(t, "{\"query\":\""+item.query+"\"}", function["arguments"])
+			}
 		})
 
 		t.Run("bedrock streaming usage should map cached_tokens", func(t *testing.T) {
